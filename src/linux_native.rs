@@ -1,6 +1,7 @@
 //! This backend uses libudev to discover devices and then talks to hidraw directly
 
 mod ioctl;
+mod udev;
 
 use std::{
     cell::{Cell, Ref, RefCell},
@@ -39,17 +40,16 @@ impl HidApiBackend {
     pub fn get_hid_device_info_vector(vid: u16, pid: u16) -> HidResult<Vec<DeviceInfo>> {
         // The C version assumes these can't fail, and they should only fail in case
         // of memory allocation issues, at which point maybe we should panic
-        let mut enumerator = match udev::Enumerator::new() {
-            Ok(e) => e,
-            Err(_) => return Ok(Vec::new()),
-        };
-        enumerator.match_subsystem("hidraw").unwrap();
+        let mut enumerator = udev::Enumerator::new();
+        enumerator.match_subsystem("hidraw");
+
         let scan = match enumerator.scan_devices() {
             Ok(s) => s,
             Err(_) => return Ok(Vec::new()),
         };
 
         let devices = scan
+            .into_iter()
             .filter_map(|device| device_to_hid_device_info(&device))
             .flatten()
             .filter(|device| vid == 0 || device.vendor_id == vid)
@@ -77,18 +77,16 @@ fn device_to_hid_device_info(raw_device: &udev::Device) -> Option<Vec<DeviceInfo
 
     // We're given the hidraw device, but we actually want to go and check out
     // the info for the parent hid device.
-    let device = match raw_device.parent_with_subsystem("hid") {
-        Ok(Some(dev)) => dev,
-        _ => return None,
+    let Some(device) = raw_device.parent_with_subsystem("hid") else {
+        return None;
     };
 
-    let (bus, vid, pid) = match device
+    let Some((bus, vid, pid)) = device
         .property_value("HID_ID")
         .and_then(|s| s.to_str())
         .and_then(parse_hid_vid_pid)
-    {
-        Some(t) => t,
-        None => return None,
+    else {
+        return None;
     };
     let bus_type = match bus {
         BUS_USB => BusType::Usb,
@@ -97,21 +95,18 @@ fn device_to_hid_device_info(raw_device: &udev::Device) -> Option<Vec<DeviceInfo
         BUS_SPI => BusType::Spi,
         _ => return None,
     };
-    let name = match device.property_value("HID_NAME") {
-        Some(name) => name,
-        None => return None,
+    let Some(name) = device.property_value("HID_NAME") else {
+        return None;
     };
-    let serial = match device.property_value("HID_UNIQ") {
-        Some(serial) => serial,
-        None => return None,
+    let Some(serial) = device.property_value("HID_UNIQ") else {
+        return None;
     };
-    let path = match raw_device
+    let Some(Ok(path)) = raw_device
         .devnode()
         .map(|p| p.as_os_str().to_os_string().into_vec())
         .map(CString::new)
-    {
-        Some(Ok(s)) => s,
-        None | Some(Err(_)) => return None,
+    else {
+        return None;
     };
 
     // Thus far we've gathered all the common attributes.
@@ -171,23 +166,18 @@ fn device_to_hid_device_info(raw_device: &udev::Device) -> Option<Vec<DeviceInfo
 
 /// Fill in the extra information that's available for a USB device.
 fn fill_in_usb(device: &udev::Device, info: DeviceInfo, name: &OsStr) -> DeviceInfo {
-    let usb_dev = match device.parent_with_subsystem_devtype("usb", "usb_device") {
-        Ok(Some(dev)) => dev,
-        Ok(None) | Err(_) => {
-            return DeviceInfo {
-                manufacturer_string: WcharString::String("".into()),
-                product_string: osstring_to_string(name.into()),
-                ..info
-            }
-        }
+    let Some(usb_dev) = device.parent_with_subsystem_devtype("usb", "usb_device") else {
+        return DeviceInfo {
+            manufacturer_string: WcharString::String("".into()),
+            product_string: osstring_to_string(name.into()),
+            ..info
+        };
     };
     let manufacturer_string = attribute_as_wchar(&usb_dev, "manufacturer");
     let product_string = attribute_as_wchar(&usb_dev, "product");
     let release_number = attribute_as_u16(&usb_dev, "bcdDevice").unwrap_or(0);
     let interface_number = device
         .parent_with_subsystem_devtype("usb", "usb_interface")
-        .ok()
-        .flatten()
         .and_then(|ref dev| attribute_as_i32(dev, "bInterfaceNumber"))
         .unwrap_or(-1);
 
@@ -384,10 +374,9 @@ fn attribute_as_u16(dev: &udev::Device, attr: &str) -> Option<u16> {
 
 /// Convert a [`OsString`] into a [`WcharString`]
 fn osstring_to_string(s: OsString) -> WcharString {
-    match s.into_string() {
-        Ok(s) => WcharString::String(s),
-        Err(_) => panic!("udev strings should always be utf8"),
-    }
+    s.into_string()
+        .map(WcharString::String)
+        .expect("udev strings should always be utf8")
 }
 
 /// Parse a HID_ID string to find the bus type, the vendor and product id
@@ -616,7 +605,9 @@ impl HidDeviceBackendBase for HidDevice {
 
         // The clone is a bit silly but we can't implement Copy. Maybe it's not
         // much worse than doing the conversion to Rust from interacting with C.
-        let device = udev::Device::from_syspath(&syspath)?;
+        let Some(device) = udev::Device::from_syspath(&syspath) else {
+            return Err(HidError::HidApiErrorEmpty);
+        };
         match device_to_hid_device_info(&device) {
             Some(info) => Ok(info[0].clone()),
             None => Err(HidError::HidApiError {
